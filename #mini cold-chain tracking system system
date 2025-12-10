@@ -1,0 +1,205 @@
+# mini-cold-chain-tracking-system
+python code :
+import serial
+import json
+import time
+from threading import Thread
+from flask import Flask, jsonify, Response
+
+# ====== CONFIGURE YOUR SERIAL PORT HERE ======
+SERIAL_PORT = "COM3"   # e.g. "COM3" on Windows, "/dev/ttyACM0" on Linux
+BAUD_RATE = 9600
+# ============================================
+
+app = Flask(__name__)
+
+latest = {"temperature": None, "alarm": None, "min": 10, "max": 25, "millis": 0}
+history = []   # list of dicts
+MAX_HISTORY = 300  # last 300 samples (~5 minutes if 1/sec)
+
+
+def read_serial_loop():
+  global latest, history
+  ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+  print("Connected to", SERIAL_PORT)
+
+  # Open CSV log file
+  log_file = open("log.csv", "a", buffering=1)
+  # Write header once (if file is empty you can add manually)
+  # log_file.write("timestamp,temperature,alarm,min,max,millis\n")
+
+  while True:
+    line = ser.readline().decode(errors="ignore").strip()
+    if not line:
+      continue
+
+    # Debug: you can uncomment this if needed
+    # print("RAW:", line)
+
+    # Only care about JSON lines
+    if not line.startswith("{"):
+      continue
+
+    try:
+      data = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+
+    latest = data
+
+    # Add server-side timestamp
+    data_with_time = dict(data)
+    data_with_time["server_time"] = time.time()
+    history.append(data_with_time)
+
+    # Keep only last N samples
+    if len(history) > MAX_HISTORY:
+      history.pop(0)
+
+    # Log to CSV file
+    log_file.write(
+      f'{time.time()},{data["temperature"]},{data["alarm"]},{data["min"]},{data["max"]},{data["millis"]}\n'
+    )
+
+
+@app.route("/api/latest")
+def api_latest():
+  return jsonify(latest)
+
+
+@app.route("/api/history")
+def api_history():
+  # return last N historical samples
+  return jsonify(history)
+
+
+# Simple built-in webpage dashboard
+@app.route("/")
+def index():
+  html = """
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>Cold Chain Monitor</title>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; padding:20px; }
+      .card { background:#111827; padding:20px; border-radius:12px; max-width:500px; margin-bottom:20px; }
+      .value { font-size:2.5rem; font-weight:bold; }
+      .ok { color:#22c55e; }
+      .alert { color:#ef4444; }
+      button { padding:8px 16px; border-radius:8px; border:none; cursor:pointer; margin-top:10px; }
+      table { border-collapse:collapse; width:100%; margin-top:10px; font-size:0.9rem; }
+      th, td { border:1px solid #374151; padding:4px 6px; text-align:center; }
+      th { background:#111827; }
+    </style>
+  </head>
+  <body>
+    <h1>Cold Chain Monitor (Arduino UNO)</h1>
+
+    <div class="card">
+      <div>Current Temperature:</div>
+      <div id="temp" class="value">-- °C</div>
+      <div>Status: <span id="status">--</span></div>
+      <div>Safe Range: <span id="range">--</span></div>
+    </div>
+
+    <div class="card">
+      <h3>History (latest readings)</h3>
+      <button onclick="loadHistory()">Refresh History</button>
+      <table id="historyTable">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Temp (°C)</th>
+            <th>Alarm</th>
+            <th>Millis</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <script>
+      async function fetchLatest() {
+        try {
+          const res = await fetch('/api/latest');
+          const data = await res.json();
+
+          if (data.temperature !== null) {
+            document.getElementById('temp').textContent =
+              data.temperature.toFixed(2) + ' °C';
+          } else {
+            document.getElementById('temp').textContent = '-- °C';
+          }
+
+          const rangeText = data.min + ' °C to ' + data.max + ' °C';
+          document.getElementById('range').textContent = rangeText;
+
+          const statusEl = document.getElementById('status');
+          if (data.alarm === 1) {
+            statusEl.textContent = 'ALERT';
+            statusEl.className = 'alert';
+          } else if (data.alarm === 0) {
+            statusEl.textContent = 'NORMAL';
+            statusEl.className = 'ok';
+          } else {
+            statusEl.textContent = 'WAITING...';
+            statusEl.className = '';
+          }
+
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      async function loadHistory() {
+        try {
+          const res = await fetch('/api/history');
+          const data = await res.json();
+          const tbody = document.querySelector('#historyTable tbody');
+          tbody.innerHTML = '';
+
+          data.forEach((item, index) => {
+            const tr = document.createElement('tr');
+
+            const tdIndex = document.createElement('td');
+            tdIndex.textContent = index + 1;
+
+            const tdTemp = document.createElement('td');
+            tdTemp.textContent = item.temperature.toFixed(2);
+
+            const tdAlarm = document.createElement('td');
+            tdAlarm.textContent = item.alarm ? 'ALERT' : 'OK';
+
+            const tdMillis = document.createElement('td');
+            tdMillis.textContent = item.millis;
+
+            tr.appendChild(tdIndex);
+            tr.appendChild(tdTemp);
+            tr.appendChild(tdAlarm);
+            tr.appendChild(tdMillis);
+
+            tbody.appendChild(tr);
+          });
+
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      // Update latest every second
+      setInterval(fetchLatest, 1000);
+      fetchLatest();
+    </script>
+  </body>
+  </html>
+  """
+  return Response(html, mimetype="text/html")
+
+
+if __name__ == "__main__":
+  t = Thread(target=read_serial_loop, daemon=True)
+  t.start()
+  print("Starting Flask server on http://127.0.0.1:5000")
+  app.run(host="0.0.0.0", port=5000, debug=False)
